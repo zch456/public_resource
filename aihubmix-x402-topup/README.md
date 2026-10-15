@@ -2,6 +2,8 @@
 
 Lets an AI agent top up an AIHubMix account with USDC on Base over x402, from $1 per top-up.
 
+Full tutorial: [x402 Tutorial: Let Your AI Agent Top Up AIHubMix with USDC](https://aihubmix.com/blog/x402-tutorial-let-your-ai-agent-top-up-aihubmix-with-usdc)
+
 No download needed. Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then run:
 
 ```bash
