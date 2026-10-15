@@ -1,15 +1,16 @@
 # /// script
 # dependencies = ["eth-account", "requests"]
 # ///
-"""AIHubMix USDC 自动充值：查余额 → 建单 → x402 付款 → 轮询到账。
+"""AIHubMix USDC top-up over x402: check balance -> create order -> pay -> wait for credit.
 
-用法：
-  uv run topup.py check   只检查配置（令牌、私钥、余额），不花钱
-  uv run topup.py 1       充值 $1（整数美元）
+Usage:
+  uv run topup.py check   check the setup (token, private key, balance) without spending anything
+  uv run topup.py 1       top up $1 (whole dollars only)
 
-令牌和私钥的读取顺序：环境变量 → ~/.aihubmix-topup.env → 在终端里输入（可选择保存）
-  AIHUBMIX_ACCESS_TOKEN  系统访问令牌（不是 sk- 开头的 API key）
-  PAYER_PRIVATE_KEY      付款钱包的私钥（Base 主网，只放少量 USDC）
+Credentials are read from environment variables, then ~/.aihubmix-topup.env, then a prompt
+in the terminal (which offers to save them):
+  AIHUBMIX_ACCESS_TOKEN  system access token (not the sk- API key)
+  PAYER_PRIVATE_KEY      private key of the paying wallet (Base mainnet, holding only a little USDC)
 """
 import base64
 import json
@@ -26,22 +27,22 @@ from eth_account.messages import encode_typed_data
 
 API = "https://aihubmix.com/api/pay/fluxa"
 BASE_RPC = "https://mainnet.base.org"
-NETWORK = "eip155:8453"  # Base 主网
+NETWORK = "eip155:8453"  # Base mainnet
 CHAIN_ID = 8453
-USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # Base 主网 USDC，6 位小数
+USDC = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"  # USDC on Base mainnet, 6 decimals
 
 CONFIG_FILE = Path.home() / ".aihubmix-topup.env"
 CONFIG_TEMPLATE = """\
-# AIHubMix USDC 充值配置。只保存在你自己的电脑上，不要发给任何人，包括 AI 助手。
-# 系统访问令牌：aihubmix.com → 个人设置 → 系统访问令牌（不是 sk- 开头的 API key）
+# AIHubMix USDC top-up settings. Keep this file on your own computer and never share it, not even with an AI assistant.
+# System access token: aihubmix.com -> personal settings -> system access token (not the sk- API key)
 AIHUBMIX_ACCESS_TOKEN={token}
-# 付款钱包私钥：只放少量 USDC 的专用钱包
+# Private key of a dedicated wallet that holds only a little USDC
 PAYER_PRIVATE_KEY={key}
 """
 
 
 def read_config():
-    # 环境变量优先，其次是配置文件
+    # Environment variables win over the config file
     saved = {}
     if CONFIG_FILE.exists():
         for line in CONFIG_FILE.read_text(encoding="utf-8").splitlines():
@@ -61,20 +62,22 @@ def write_config(token, key):
     fd = os.open(CONFIG_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(CONFIG_TEMPLATE.format(token=token, key=key))
-    os.chmod(CONFIG_FILE, 0o600)  # 只有自己能读
+    os.chmod(CONFIG_FILE, 0o600)  # readable by you only
 
 
 def setup_credentials():
-    # 缺令牌或私钥：能交互就在终端里输入；否则（例如由 AI 工具代为运行）生成配置文件让用户自己填
+    # Missing credentials: prompt if there's a terminal; otherwise (e.g. run by an AI tool)
+    # write a blank config file for the user to fill in
     global ACCESS_TOKEN, PRIVATE_KEY
     if not sys.stdin.isatty():
         if not CONFIG_FILE.exists():
             write_config("", "")
-        sys.exit(f"缺少令牌或私钥：请用文本编辑器打开 {CONFIG_FILE}，填好后保存，再重新运行")
-    ACCESS_TOKEN = ACCESS_TOKEN or getpass("系统访问令牌（输入时不显示）: ").strip()
-    PRIVATE_KEY = PRIVATE_KEY or getpass("钱包私钥（输入时不显示）: ").strip()
-    wallet_address()  # 私钥格式不对就不保存
-    if input(f"保存到 {CONFIG_FILE}，下次不用再输？[Y/n] ").strip().lower() != "n":
+        sys.exit(f"Missing access token or private key: open {CONFIG_FILE} in a text editor, "
+                 "fill in both, save it, then run this again")
+    ACCESS_TOKEN = ACCESS_TOKEN or getpass("System access token (input hidden): ").strip()
+    PRIVATE_KEY = PRIVATE_KEY or getpass("Wallet private key (input hidden): ").strip()
+    wallet_address()  # don't save a malformed key
+    if input(f"Save to {CONFIG_FILE} so you don't have to type them again? [Y/n] ").strip().lower() != "n":
         write_config(ACCESS_TOKEN, PRIVATE_KEY)
 
 
@@ -82,11 +85,12 @@ def wallet_address():
     try:
         return Account.from_key(PRIVATE_KEY).address
     except ValueError:
-        sys.exit(f"私钥格式不对，应为 64 位十六进制字符（可带 0x 前缀）。请检查 {CONFIG_FILE} 或环境变量")
+        sys.exit("Invalid private key: expected 64 hex characters (0x prefix optional). "
+                 f"Check {CONFIG_FILE} or your environment variables")
 
 
 def usdc_balance(address):
-    # 调用 USDC 合约的 balanceOf(address)，返回美元金额
+    # Call balanceOf(address) on the USDC contract; returns dollars
     data = "0x70a08231" + address[2:].lower().rjust(64, "0")
     resp = requests.post(BASE_RPC, json={
         "jsonrpc": "2.0", "id": 1, "method": "eth_call",
@@ -97,7 +101,7 @@ def usdc_balance(address):
 
 
 def aihubmix(method, path, **kwargs):
-    # 裸令牌，不加 Bearer；除 401/403 外，业务错误都是 HTTP 200 + success:false
+    # Bare token, no "Bearer"; apart from 401/403, business errors come back as HTTP 200 + success:false
     resp = requests.request(
         method, f"{API}/{path}",
         headers={"Authorization": ACCESS_TOKEN}, timeout=30, **kwargs,
@@ -113,7 +117,7 @@ def aihubmix(method, path, **kwargs):
 
 
 def check_token():
-    # 用一个不存在的订单号查单：令牌有效时返回 Order not found，不会建单
+    # Query an order number that doesn't exist: a valid token gets "Order not found", and no order is created
     try:
         aihubmix("GET", "qry", params={"trade_no": "pl_check"})
     except RuntimeError as e:
@@ -126,7 +130,7 @@ def create_order(amount):
 
 
 def check_challenge(req, amount):
-    # 自动付款没有人做最后确认，这四项就是那道确认，任一不符就不签名
+    # Nobody approves an automatic payment, so these four checks are that approval; any mismatch means no signature
     expected = str(amount * 10**6)
     problems = []
     if req.get("scheme") != "exact":
@@ -136,9 +140,9 @@ def check_challenge(req, amount):
     if str(req.get("asset", "")).lower() != USDC.lower():
         problems.append(f"asset={req.get('asset')}")
     if str(req.get("maxAmountRequired")) != expected:
-        problems.append(f"maxAmountRequired={req.get('maxAmountRequired')}，应为 {expected}")
+        problems.append(f"maxAmountRequired={req.get('maxAmountRequired')}, expected {expected}")
     if problems:
-        raise RuntimeError("402 挑战校验失败，已中止：" + "；".join(problems))
+        raise RuntimeError("402 challenge check failed, aborting: " + "; ".join(problems))
 
 
 def sign_authorization(req):
@@ -187,10 +191,10 @@ def sign_authorization(req):
 
 
 def pay(url, amount):
-    # 这两次请求都不带 access_token：x402 里付款方是匿名的
+    # Neither request carries the access token: the payer is anonymous in x402
     first = requests.get(url, timeout=30)
     if first.status_code != 402:
-        raise RuntimeError(f"预期 402，实际 {first.status_code}: {first.text[:200]}")
+        raise RuntimeError(f"Expected 402, got {first.status_code}: {first.text[:200]}")
     req = first.json()["accepts"][0]
     check_challenge(req, amount)
 
@@ -203,7 +207,7 @@ def pay(url, amount):
     header = base64.b64encode(json.dumps(payment).encode()).decode()
     second = requests.get(url, headers={"X-PAYMENT": header}, timeout=60)
     if second.status_code not in (200, 202):
-        raise RuntimeError(f"付款未被受理 {second.status_code}: {second.text[:200]}")
+        raise RuntimeError(f"Payment not accepted, {second.status_code}: {second.text[:200]}")
     return (second.json().get("receipt") or {}).get("txHash")
 
 
@@ -213,44 +217,44 @@ def wait_for_credit(trade_no, max_wait=600):
         try:
             order = aihubmix("GET", "qry", params={"trade_no": trade_no})
         except requests.RequestException as e:
-            print("查单失败，稍后重试：", e)
+            print("Order query failed, retrying:", e)
         else:
             if order["status"] == "TRADE_SUCCESS":
                 return "credited"
             if order["status"] == "TRADE_CLOSED" or order.get("expired"):
                 return "failed"
-        time.sleep(8)  # 服务端每张单 5 秒节流，更密没有意义
-    return "pending"  # 不代表失败，兜底对账会在分钟级补上
+        time.sleep(8)  # the server refreshes each order at most every 5 seconds
+    return "pending"  # not a failure: reconciliation credits it within minutes
 
 
 if __name__ == "__main__":
     arg = sys.argv[1] if len(sys.argv) > 1 else "1"
     if arg != "check" and not arg.isdigit():
-        sys.exit("用法：topup.py 金额（整数美元，例如 1），或 topup.py check 只检查配置")
+        sys.exit("Usage: topup.py AMOUNT (whole dollars, e.g. 1), or topup.py check to check the setup only")
     if not ACCESS_TOKEN or not PRIVATE_KEY:
         setup_credentials()
     address = wallet_address()
     try:
         balance = usdc_balance(address)
-        print(f"付款钱包: {address}（USDC 余额 {balance}）")
+        print(f"Wallet: {address} (USDC balance {balance})")
         if arg == "check":
             check_token()
             if balance == 0:
-                print("钱包里还没有 USDC：请往上面的地址转入 Base 主网 USDC")
-            print("令牌和私钥都没问题，可以充值了")
+                print("This wallet has no USDC yet: send Base mainnet USDC to the address above")
+            print("Access token and private key are fine. Ready to top up.")
             sys.exit()
 
-        # 建单会占用当天次数，所以先确认余额够用
+        # Creating an order uses up one of today's attempts, so check the balance first
         amount = int(arg)
         if balance < amount:
-            sys.exit(f"USDC 余额不足 {amount}，请先往这个地址转入 Base 主网 USDC")
+            sys.exit(f"USDC balance is below {amount}: send Base mainnet USDC to this address first")
 
         order = create_order(amount)
         print("tradeNo:", order["tradeNo"])
 
         tx_hash = pay(order["url"], order["amount"])
-        print("txHash:", tx_hash)  # 唯一的链上凭证，务必持久化
+        print("txHash:", tx_hash)  # the only on-chain receipt; keep it
 
         print("result:", wait_for_credit(order["tradeNo"]))
     except (RuntimeError, ValueError, requests.RequestException) as e:
-        sys.exit(f"出错了：{e}")
+        sys.exit(f"Error: {e}")
